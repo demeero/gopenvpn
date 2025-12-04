@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NordSecurity/gopenvpn/demux"
+	"github.com/demeero/gopenvpn/demux"
 )
 
 var (

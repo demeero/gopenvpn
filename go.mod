@@ -1,3 +1,3 @@
-module github.com/NordSecurity/gopenvpn
+module github.com/demeero/gopenvpn
 
 go 1.18
