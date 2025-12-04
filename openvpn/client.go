@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/NordSecurity/gopenvpn/demux"
@@ -28,14 +29,34 @@ const (
 	StatusFormatV3      StatusFormat = "3"
 )
 
+// RemoteEntry describes one remote-entry from the management interface.
+//
+// The format of the string with openvpn 2.6+ is something like this:
+//
+//	"0,vpn.example.com,1194,udp"
+//
+// or (on some builds):
+//
+//	"REMOTE-ENTRY:0,vpn.example.com,1194,udp"
+//
+// We parse the base fields and store the raw string in Raw so that nothing is lost.
+type RemoteEntry struct {
+	Index int      // remote entry index
+	Host  string   // hostname / ip
+	Port  int      // port
+	Proto string   // udp/tcp/...
+	Flags []string // additional fields (if any) after the 4th
+	Raw   string   // raw payload from management interface
+}
+
 // MgmtClient .
 type MgmtClient struct {
 	wc      io.WriteCloser
 	replies <-chan []byte
 }
 
-func (m *MgmtClient) Close() error {
-	return m.wc.Close()
+func (c *MgmtClient) Close() error {
+	return c.wc.Close()
 }
 
 // NewClient creates a new MgmtClient that communicates via the given
@@ -267,6 +288,72 @@ func (c *MgmtClient) Pid() (int, error) {
 	return pid, nil
 }
 
+// RemoteEntryCount executes the "remote-entry-count" command and returns the number of remote entries.
+func (c *MgmtClient) RemoteEntryCount() (int, error) {
+	raw, err := c.simpleCommand("remote-entry-count")
+	if err != nil {
+		return 0, err
+	}
+
+	s := strings.TrimSpace(string(raw))
+	if s == "" {
+		return 0, fmt.Errorf("remote-entry-count: empty response")
+	}
+
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("remote-entry-count: malformed numeric response %q: %w", s, err)
+	}
+	return n, nil
+}
+
+// RemoteEntryGetAll performs "remote-entry-get all" and returns a list of remote entries.
+//
+// The format of the strings may vary slightly between versions, but typically:
+//
+// "0,vpn.example.com,1194,udp"
+//
+//	or:
+//
+// "REMOTE-ENTRY:0,vpn.example.com,1194,udp"
+func (c *MgmtClient) RemoteEntryGetAll() ([]RemoteEntry, error) {
+	if err := c.sendCommand([]byte("remote-entry-get all")); err != nil {
+		return nil, err
+	}
+
+	lines, err := c.readCommandResponsePayload()
+	if err != nil {
+		return nil, err
+	}
+
+	entries := make([]RemoteEntry, 0, len(lines))
+	for _, line := range lines {
+		raw := strings.TrimSpace(string(line))
+		if raw == "" || raw == "END" {
+			continue
+		}
+
+		entry, err := parseRemoteEntryLine(raw)
+		if err != nil {
+			return nil, fmt.Errorf("remote-entry-get: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// RemoteMod sends "remote MOD <host> <port>".
+//
+// Used with --management-query-remote and >REMOTE notification.
+// At the management level, this is just a command with a SUCCESS/ERROR result.
+func (c *MgmtClient) RemoteMod(host string, port int) error {
+	cmd := fmt.Sprintf("remote MOD %s %d", host, port)
+	if _, err := c.simpleCommand(cmd); err != nil {
+		return fmt.Errorf("remote MOD %s %d: %w", host, port, err)
+	}
+	return nil
+}
+
 // Auth sends username and password to the OpenVPN process.
 func (c *MgmtClient) Auth(username, password string) error {
 	_, err := c.simpleCommand(fmt.Sprintf("username \"Auth\" %s", username))
@@ -302,6 +389,58 @@ func (c *MgmtClient) sendCommandPayload(payload []byte) error {
 	}
 	_, err = c.wc.Write(newline)
 	return err
+}
+
+func parseRemoteEntryLine(raw string) (RemoteEntry, error) {
+	orig := raw
+
+	if strings.HasPrefix(raw, "REMOTE-ENTRY:") {
+		raw = strings.TrimSpace(strings.TrimPrefix(raw, "REMOTE-ENTRY:"))
+	}
+
+	var parts []string
+	if strings.Contains(raw, ",") {
+		parts = strings.Split(raw, ",")
+	} else {
+		parts = strings.Fields(raw) // fallback
+	}
+
+	if len(parts) < 4 {
+		return RemoteEntry{}, fmt.Errorf("unexpected remote-entry format %q", orig)
+	}
+
+	idxStr := strings.TrimSpace(parts[0])
+	host := strings.TrimSpace(parts[1])
+	portStr := strings.TrimSpace(parts[2])
+	proto := strings.TrimSpace(parts[3])
+
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil {
+		return RemoteEntry{}, fmt.Errorf("parse index in %q: %w", orig, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return RemoteEntry{}, fmt.Errorf("parse port in %q: %w", orig, err)
+	}
+
+	flags := make([]string, 0)
+	if len(parts) > 4 {
+		for _, f := range parts[4:] {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				flags = append(flags, f)
+			}
+		}
+	}
+
+	return RemoteEntry{
+		Index: idx,
+		Host:  host,
+		Port:  port,
+		Proto: proto,
+		Flags: flags,
+		Raw:   orig,
+	}, nil
 }
 
 func (c *MgmtClient) readCommandResult() ([]byte, error) {
